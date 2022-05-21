@@ -1,6 +1,8 @@
 # awsASGretirmentAutomation
 This is used to help with aws retirments for ASGs that have small amounts of instances. 
-
+System manage Automation name: RetirmentAutomation
+Account: 
+https://us-east-1.console.aws.amazon.com/systems-manager/documents/RetirmentAutomation/description?region=us-east-1
 This automation will:
 1. Take Input for what ASG and what Instance to retire (terminate)
 2. Call the AWS API to get the current size of the ASG
