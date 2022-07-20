@@ -1,0 +1,210 @@
+description: |
+  The goal of this automation is to assist with the retirments from aws. Right now the SOP for our team is to do the following for each case:
+
+  1. Check name of instance (we cant do SQL databased or elastic search instances)
+  2. Check if instance has asg
+  3. If no ASG do a simple STOP -> start on instance
+  4. If ASG has greater than 10 instances then stop instance and let asg mark as unhealthy
+  5. If ASG is less than 10 than Scale out asg (x+1) check new instance is ready, then  set scale in protection on all instances other than target instance. Then scale back in ASG to regular size  
+
+  Info needed for automation:
+  * Instance ID
+  * ASG name (if no ASG put "NONE")
+  * Change number
+
+  Final goals for automation:
+
+  * Check if there is a ASG from just the instance ID
+  * Send emails to change management
+  * update JIRA tickets when completed
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.
+  AutoScalingGroupName:
+    type: String
+    default: retirementtesting1
+    description: (Required) The Name of the ASG
+  InstanceId:
+    type: String
+    description: (Required) The Instance to be Retired
+  CRQTicket:
+    type: String
+    description: '(Required) CRQ Ticket '
+    default: CRQ-111111
+mainSteps:
+  - name: GetInstanceInfoNOTWORKING
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: DescribeTags
+    description: |
+      Retrieves info of instance to be retired
+      - Instance Id
+      - Instance Name
+      - Owner
+    onFailure: Continue
+    isCritical: false
+  - name: sendCRQEmail
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: sns
+      Api: Publish
+      Message: '**Hello NOC**, Will be starting - {{CRQTicket}}. Instance to be retired is: -{{InstanceId}} Please acknowledge'
+      TargetArn: 'arn:aws:sns:us-east-1:343338773393:NotifyMe'
+      Subject: '{{CRQTicket}} - AWS Retirment - Blah Blah Blah'
+    isCritical: false
+    onFailure: Continue
+  - name: waitforACK
+    action: 'aws:pause'
+    inputs:
+      Message: Waiting for ACK
+    description: |-
+      Waiting for ACK.
+
+      Once acked click actions and then resume
+  - name: GetASGCapacity
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: autoscaling
+      Api: DescribeAutoScalingGroups
+      AutoScalingGroupNames:
+        - '{{AutoScalingGroupName}}'
+    outputs:
+      - Name: CurrentDesiredCapacity
+        Selector: '$.AutoScalingGroups[0].DesiredCapacity'
+        Type: Integer
+      - Name: CurrentMaxSize
+        Selector: '$.AutoScalingGroups[0].MaxSize'
+        Type: Integer
+  - name: ChoosePlayBook
+    action: 'aws:branch'
+    inputs:
+      Choices:
+        - NextStep: greaterThen10_stopInstance
+          Variable: '{{GetASGCapacity.CurrentDesiredCapacity}}'
+          NumericGreaterOrEquals: 10
+        - NextStep: getNewASGCapacity
+          Variable: '{{GetASGCapacity.CurrentDesiredCapacity}}'
+          NumericLesserOrEquals: 10
+  - name: getNewASGCapacity
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: |-
+        import math
+        def script_handler(events, context):
+          return {
+              'NewDesiredCapacity': math.ceil(events['CurrentDesiredCapacity'] * 1.5),
+              'NewMaxSize': max(math.ceil(events['CurrentDesiredCapacity'] * 1.5), events['CurrentMaxSize'])
+          }
+      InputPayload:
+        CurrentDesiredCapacity: '{{GetASGCapacity.CurrentDesiredCapacity}}'
+        CurrentMaxSize: '{{GetASGCapacity.CurrentMaxSize}}'
+    outputs:
+      - Name: NewDesiredCapacity
+        Selector: $.Payload.NewDesiredCapacity
+        Type: Integer
+      - Name: NewMaxSize
+        Selector: $.Payload.NewMaxSize
+        Type: Integer
+    description: Increase the current ASG desired and MAX capacity by 1
+  - name: ScaleOutASG
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: autoscaling
+      Api: UpdateAutoScalingGroup
+      AutoScalingGroupName: '{{AutoScalingGroupName}}'
+      DesiredCapacity: '{{getNewASGCapacity.NewDesiredCapacity}}'
+      MaxSize: '{{getNewASGCapacity.NewMaxSize}}'
+    description: Scale Out the ASG to new Desired Capacity
+  - name: WaitForScaleOut
+    action: 'aws:executeScript'
+    inputs:
+      Runtime: python3.8
+      Handler: wait_for_in_service
+      Script: |-
+        import logging
+        import random
+        import time
+        from math import ceil
+
+        import boto3
+        from botocore.config import Config
+
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.INFO)
+
+
+
+        def wait_for_in_service(events, context):
+            client = boto3.client('autoscaling')
+            while (True):
+                res = client.describe_auto_scaling_groups(AutoScalingGroupNames=[events['AutoScalingGroupName']])
+                instances = res['AutoScalingGroups'][0]['Instances']
+                num_in_service = sum(instance['LifecycleState'] == 'InService' for instance in instances)
+                if (num_in_service >= events['NewDesiredCapacity']):
+                    return True
+                time.sleep(15)
+      InputPayload:
+        AutoScalingGroupName: '{{AutoScalingGroupName}}'
+        NewDesiredCapacity: '{{getNewASGCapacity.NewDesiredCapacity}}'
+    description: Wait for instance to be in service
+  - name: getInstanceScreenshot
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: ec2
+      Api: GetConsoleScreenshot
+      InstanceId: '{{InstanceId}}'
+      WakeUp: true
+    outputs:
+      - Name: imageData
+        Selector: '$.ec2[0].GetConsoleScreenshot'
+        Type: String
+    description: 'https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_GetConsoleScreenshot.html'
+    onFailure: Continue
+    isCritical: false
+  - name: confirmNewInstanceUp
+    action: 'aws:pause'
+    inputs:
+      Message: Please confirm that the instance is in a healthy state
+    description: Please confirm that the instance is in a healthy state
+  - name: terminateInstanceandScaleIn
+    action: 'aws:executeAwsApi'
+    inputs:
+      Api: TerminateInstanceInAutoScalingGroup
+      Service: autoscaling
+      InstanceId: '{{InstanceId}}'
+      ShouldDecrementDesiredCapacity: true
+    description: 'https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_TerminateInstanceInAutoScalingGroup.html'
+  - name: makesureTerminated
+    action: 'aws:changeInstanceState'
+    inputs:
+      InstanceIds: '{{InstanceId}}'
+      DesiredState: terminated
+      CheckStateOnly: true
+    isCritical: false
+    onFailure: Continue
+  - name: pausetoconfirmfinished
+    action: 'aws:pause'
+    inputs:
+      Message: Select Resume when ready to close off the CRQ and send the Change completed email
+    description: Select Resume when ready to close off the CRQ and send the Change completed email
+  - name: sendoffcloseCRQemail
+    action: 'aws:executeAwsApi'
+    inputs:
+      Service: sms
+      Api: Publish
+      Subject: '{{CRQTicket}} - AWS Retirment - Blah Blah Blah'
+      Message: 'Change {{CRQTicket}} Completed'
+    isEnd: true
+  - name: greaterThen10_stopInstance
+    action: 'aws:changeInstanceState'
+    inputs:
+      InstanceIds: '{{InstanceId}}'
+      DesiredState: stopped
+      Force: true
+    nextStep: sendoffcloseCRQemail
